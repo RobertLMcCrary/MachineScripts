@@ -116,41 +116,54 @@ fi
 # authorized_keys
 # ------------------------------------------------------------
 
-install_authorized_key() {
-    log "Installing team SSH public key"
+AUTH_FILE="$TARGET_HOME/.ssh/authorized_keys"
 
-    local ssh_dir="$TARGET_HOME/.ssh"
-    local auth_file="$ssh_dir/authorized_keys"
+# Drop every line containing key blob $1, then append line $2 if given.
+rewrite_authorized_keys() {
+    local drop_blob="$1"
+    local add_line="${2:-}"
     local tmp
 
+    # An empty pattern could match every line and wipe the file.
+    [ -n "$drop_blob" ] ||
+        die "Refusing to rewrite $AUTH_FILE without a key to match."
+
     tmp="$(mktemp)"
+
+    as_root awk \
+        -v blob="$drop_blob" \
+        'index($0, blob) == 0 { print }' \
+        "$AUTH_FILE" > "$tmp"
+
+    if [ -n "$add_line" ]; then
+        printf '%s\n' "$add_line" >> "$tmp"
+    fi
+
+    as_root cp "$tmp" "$AUTH_FILE"
+
+    rm -f "$tmp"
+
+    as_root chown \
+        "$TARGET_USER:$TARGET_GROUP" \
+        "$AUTH_FILE"
+
+    as_root chmod 600 "$AUTH_FILE"
+}
+
+install_authorized_key() {
+    log "Installing team SSH public key"
 
     as_root install \
         -d \
         -m 700 \
         -o "$TARGET_USER" \
         -g "$TARGET_GROUP" \
-        "$ssh_dir"
+        "$TARGET_HOME/.ssh"
 
-    as_root touch "$auth_file"
+    as_root touch "$AUTH_FILE"
 
-    # Remove an older copy of this exact key, if present.
-    as_root awk \
-        -v blob="$KEY_BLOB" \
-        'index($0, blob) == 0 { print }' \
-        "$auth_file" > "$tmp"
-
-    printf '%s\n' "$AUTHORIZED_KEY" >> "$tmp"
-
-    as_root cp "$tmp" "$auth_file"
-
-    rm -f "$tmp"
-
-    as_root chown \
-        "$TARGET_USER:$TARGET_GROUP" \
-        "$auth_file"
-
-    as_root chmod 600 "$auth_file"
+    # Replaces an older copy of this exact key, if present.
+    rewrite_authorized_keys "$KEY_BLOB" "$AUTHORIZED_KEY"
 }
 
 # ------------------------------------------------------------
@@ -450,12 +463,35 @@ enable_ssh_macos() {
         /System/Library/LaunchDaemons/ssh.plist \
         >/dev/null 2>&1 || true
 
-    if ! remote_login_enabled; then
+    if remote_login_enabled; then
+        return
+    fi
 
-        warn "Remote Login is still off. Enable it manually:"
-        warn "System Settings > General > Sharing > Remote Login"
+    # Common on a fresh Mac: without Full Disk Access neither method above
+    # works, so have the person at the machine flip the switch, and wait.
+    if (: </dev/tty) 2>/dev/null; then
+
+        warn "macOS would not let this script turn on Remote Login."
+        warn "Turn it on now: System Settings > General > Sharing > Remote Login"
+
+        open 'x-apple.systempreferences:com.apple.Sharing-Settings.extension' \
+            >/dev/null 2>&1 || true
+
+        log "Waiting up to 5 minutes for Remote Login to be turned on"
+
+        local i=0
+
+        while [ "$i" -lt 150 ] && ! remote_login_enabled; do
+            sleep 2
+            i=$((i + 1))
+        done
 
     fi
+
+    remote_login_enabled ||
+        die "Remote Login is off. Turn it on under System Settings > General > Sharing > Remote Login, then run this again."
+
+    log "Remote Login is on"
 }
 
 # dsmemberutil resolves membership the same way sshd's SACL check does
@@ -852,9 +888,87 @@ connect_tailscale() {
 # Result
 # ------------------------------------------------------------
 
+SELF_TEST_DIR=''
+SELF_TEST_BLOB=''
+SELF_TEST_ERROR=''
+
+cleanup_self_test() {
+    if [ -n "$SELF_TEST_BLOB" ]; then
+        rewrite_authorized_keys "$SELF_TEST_BLOB" || true
+        SELF_TEST_BLOB=''
+    fi
+
+    if [ -n "$SELF_TEST_DIR" ]; then
+        rm -rf "$SELF_TEST_DIR"
+        SELF_TEST_DIR=''
+    fi
+}
+
+# Log in over Tailscale with a throwaway key, restricted exactly like the
+# team key, so "complete" means a teammate's login will actually work:
+# sshd running, Remote Login access group, authorized_keys permissions and
+# the Tailscale-only source restriction are all exercised.
+self_test_ssh() {
+    local ts_ip="$1"
+    local output
+
+    trap cleanup_self_test EXIT
+    trap 'cleanup_self_test; exit 130' INT TERM
+
+    SELF_TEST_DIR="$(mktemp -d)"
+
+    # Called inside `if`, where set -e is off, so check each step.
+    if ! ssh-keygen -q -t ed25519 -N '' \
+        -C 'team-bootstrap-selftest' \
+        -f "$SELF_TEST_DIR/key"
+    then
+        cleanup_self_test
+        trap - EXIT INT TERM
+        SELF_TEST_ERROR='could not create a test key'
+        return 1
+    fi
+
+    SELF_TEST_BLOB="$(awk '{print $2}' "$SELF_TEST_DIR/key.pub")"
+
+    rewrite_authorized_keys \
+        "$SELF_TEST_BLOB" \
+        "from=\"${TAILSCALE_V4},${TAILSCALE_V6}\",restrict,command=\"echo team-bootstrap-ok\" $(cat "$SELF_TEST_DIR/key.pub")"
+
+    output="$(
+        ssh \
+            -F /dev/null \
+            -i "$SELF_TEST_DIR/key" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o GlobalKnownHostsFile=/dev/null \
+            -o LogLevel=ERROR \
+            "$TARGET_USER@$ts_ip" 2>&1
+    )" || true
+
+    cleanup_self_test
+
+    trap - EXIT INT TERM
+
+    case "$output" in
+        *team-bootstrap-ok*)
+            return 0
+            ;;
+    esac
+
+    SELF_TEST_ERROR="${output:-no output}"
+
+    return 1
+}
+
 show_result() {
 
     local ts_ip
+    local ts_name
+    local alias_name
+    local problem=''
 
     ts_ip="$(
         ts ip -4 2>/dev/null |
@@ -862,34 +976,70 @@ show_result() {
         true
     )"
 
+    ts_name="$(
+        ts status --json --peers=false 2>/dev/null |
+        sed -n 's/^ *"DNSName": "\([^"]*\)\.",*$/\1/p' |
+        head -n 1 ||
+        true
+    )"
+
+    alias_name="${ts_name%%.*}"
+    alias_name="${alias_name:-$(hostname -s | tr '[:upper:]' '[:lower:]')}"
+
+    if [ -z "$ts_ip" ] || ! tailscale_is_running; then
+
+        problem='Tailscale is not connected. Finish the Tailscale login, then run this script again.'
+
+    elif ! have ssh; then
+
+        warn "No ssh client on this machine; skipping the login self-test."
+
+    else
+
+        log "Testing an SSH login over Tailscale"
+
+        if ! self_test_ssh "$ts_ip"; then
+            problem="A test SSH login over Tailscale failed: $SELF_TEST_ERROR"
+        fi
+
+    fi
+
     printf '\n'
     printf '============================================================\n'
-    printf ' SERVER BOOTSTRAP COMPLETE\n'
+
+    if [ -n "$problem" ]; then
+        printf ' SERVER BOOTSTRAP NOT READY\n'
+    else
+        printf ' SERVER BOOTSTRAP COMPLETE\n'
+    fi
+
     printf '============================================================\n'
     printf 'OS:             %s\n' "$PLATFORM"
     printf 'SSH user:       %s\n' "$TARGET_USER"
     printf 'Tailscale IPv4: %s\n' "${ts_ip:-unavailable}"
+    printf 'Tailscale name: %s\n' "${ts_name:-unavailable}"
     printf '\n'
 
-    printf 'Tailscale status:\n'
-
-    ts status || true
-
-    printf '\n'
-
-    if [ -n "$ts_ip" ]; then
-
-        printf 'Connect with:\n\n'
-
-        printf \
-            '  ssh %s@%s\n\n' \
-            "$TARGET_USER" \
-            "$ts_ip"
-
+    if [ -n "$problem" ]; then
+        printf 'ERROR: %s\n' "$problem" >&2
+        exit 1
     fi
 
+    printf 'Verified: a test login over Tailscale succeeded.\n'
     printf 'SSH password authentication is disabled.\n'
     printf 'Team SSH key is restricted to Tailscale source addresses.\n'
+    printf '\n'
+    printf 'On the computer you connect from (it must be signed in to\n'
+    printf 'Tailscale and have the team key), add to ~/.ssh/config:\n'
+    printf '\n'
+    printf 'Host %s\n' "$alias_name"
+    printf '    HostName %s\n' "$ts_ip"
+    printf '    User %s\n' "$TARGET_USER"
+    printf '    IdentityFile ~/.ssh/colmena_hetzner\n'
+    printf '    IdentitiesOnly yes\n'
+    printf '\n'
+    printf 'Then connect with:\n\n'
+    printf '  ssh %s\n\n' "$alias_name"
 }
 
 # ------------------------------------------------------------

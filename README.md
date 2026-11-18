@@ -11,7 +11,8 @@ The bootstrap scripts:
 - Restrict the team SSH key to Tailscale connections
 - Enable services at startup
 - Run Tailscale login if the machine is not already authenticated
-- Print the Tailscale IP and SSH command when finished
+- Test a real SSH login over Tailscale before reporting success (Linux and macOS)
+- Print the `~/.ssh/config` entry to use on the computer you connect from
 
 > **Heads up:** password and keyboard-interactive SSH logins are turned off for
 > **every** account on the machine, not just the team key. Anyone who currently
@@ -72,23 +73,15 @@ On macOS:
   MDM profile blocks the change, the script stops and says so. On MDM-managed
   Macs (e.g. Jamf), a management policy may reset this group later.
 - If Remote Login cannot be turned on automatically (recent macOS requires Full
-  Disk Access for this), the script tells you to enable it under
-  **System Settings > General > Sharing > Remote Login**.
+  Disk Access for this), the script opens **System Settings > General > Sharing**
+  and waits up to 5 minutes for you to turn on **Remote Login**.
 - Macs managed by nix-darwin are refused. Configure SSH and Tailscale in your
   nix-darwin config instead.
 
-Check the machine afterward:
-
-```bash
-tailscale status
-tailscale ip -4
-```
-
-Connect with:
-
-```bash
-ssh USERNAME@100.x.x.x
-```
+At the end, the script logs in over Tailscale with a throwaway key (restricted
+the same way as the team key, and removed afterward). It only prints
+**SERVER BOOTSTRAP COMPLETE** if that login worked; otherwise it prints
+**NOT READY** with the reason and exits with an error.
 
 ### Unattended Tailscale login
 
@@ -106,18 +99,22 @@ irm https://raw.githubusercontent.com/RobertLMcCrary/MachineScripts/main/bootstr
 
 Never commit an auth key to this repository.
 
-## Connect by name (MagicDNS)
+## Connecting
 
-Instead of remembering `100.x.x.x` addresses, turn on **MagicDNS** in the
-Tailscale admin console (DNS page) and rename each machine there (e.g.
-`h16001mac`). Each one then resolves as `NAME.your-tailnet.ts.net`, and as
-plain `NAME` from other devices on the tailnet.
+The computer you connect **from** needs two things:
 
-Add an alias per machine to `~/.ssh/config` on the device you connect from:
+1. **Tailscale running and signed in to the same tailnet.** The team key is
+   only accepted from Tailscale addresses, and SSH traffic only reaches the
+   server through Tailscale. If `ssh` just hangs at "Connecting to...", check
+   this first: `tailscale ping MACHINE-NAME` must get a `pong`.
+2. **The team private key** at `~/.ssh/colmena_hetzner`.
+
+The bootstrap prints the exact `~/.ssh/config` entry for each machine. It
+looks like this:
 
 ```sshconfig
-Host h16001mac
-    HostName h16001mac.your-tailnet.ts.net
+Host h16003mac
+    HostName 100.102.1.90
     User rmccrar6
     IdentityFile ~/.ssh/colmena_hetzner
     IdentitiesOnly yes
@@ -126,8 +123,11 @@ Host h16001mac
 Then just:
 
 ```bash
-ssh h16001mac
+ssh h16003mac
 ```
+
+`HostName` is the machine's Tailscale IP, which works whether or not MagicDNS
+is on. With MagicDNS enabled you can use `NAME.your-tailnet.ts.net` instead.
 
 ## NixOS
 

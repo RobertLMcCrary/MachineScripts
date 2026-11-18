@@ -64,6 +64,10 @@ On macOS:
   fit for a headless Mac.
 - Otherwise the official Tailscale app is installed. It may ask you to approve
   its network extension in System Settings, so someone needs to be at the machine.
+- If Remote Login is limited to **Only these users**, the account is added to
+  the `com.apple.access_ssh` group. Without that, macOS rejects the login even
+  with a valid key. If an MDM profile blocks the change, the script stops and
+  says so.
 - If Remote Login cannot be turned on automatically (recent macOS requires Full
   Disk Access for this), the script tells you to enable it under
   **System Settings > General > Sharing > Remote Login**.
@@ -98,6 +102,29 @@ irm https://raw.githubusercontent.com/RobertLMcCrary/MachineScripts/main/bootstr
 ```
 
 Never commit an auth key to this repository.
+
+## Connect by name (MagicDNS)
+
+Instead of remembering `100.x.x.x` addresses, turn on **MagicDNS** in the
+Tailscale admin console (DNS page) and rename each machine there (e.g.
+`h16001mac`). Each one then resolves as `NAME.your-tailnet.ts.net`, and as
+plain `NAME` from other devices on the tailnet.
+
+Add an alias per machine to `~/.ssh/config` on the device you connect from:
+
+```sshconfig
+Host h16001mac
+    HostName h16001mac.your-tailnet.ts.net
+    User rmccrar6
+    IdentityFile ~/.ssh/colmena_hetzner
+    IdentitiesOnly yes
+```
+
+Then just:
+
+```bash
+ssh h16001mac
+```
 
 ## NixOS
 

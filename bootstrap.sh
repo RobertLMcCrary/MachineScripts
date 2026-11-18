@@ -425,6 +425,44 @@ enable_ssh_macos() {
     fi
 }
 
+ssh_access_member() {
+    as_root dseditgroup \
+        -o checkmember \
+        -m "$TARGET_USER" \
+        com.apple.access_ssh 2>/dev/null |
+        grep -q '^yes'
+}
+
+# Remote Login set to "Only these users" rejects anyone outside this group,
+# even with a valid key. sshd logs it as "not in SACL" and the client just
+# sees "Permission denied".
+configure_macos_ssh_access() {
+    # No group means Remote Login allows all users. Creating it would lock
+    # everyone else out, so leave it alone.
+    if ! dscl . -read /Groups/com.apple.access_ssh >/dev/null 2>&1; then
+        log "Remote Login allows all users; no SSH access group to update"
+        return
+    fi
+
+    if ssh_access_member; then
+        log "$TARGET_USER already has SSH access"
+        return
+    fi
+
+    log "Granting SSH access to $TARGET_USER"
+
+    as_root dseditgroup \
+        -o edit \
+        -a "$TARGET_USER" \
+        -t user \
+        com.apple.access_ssh || true
+
+    # MDM profiles can block or revert this, so check instead of trusting
+    # the exit status.
+    ssh_access_member ||
+        die "Could not add $TARGET_USER to com.apple.access_ssh. An MDM policy may be blocking it; add the account under System Settings > General > Sharing > Remote Login."
+}
+
 # ------------------------------------------------------------
 # Linux Tailscale
 # ------------------------------------------------------------
@@ -753,6 +791,7 @@ main() {
         install_authorized_key
         configure_sshd_key_only
         enable_ssh_macos
+        configure_macos_ssh_access
 
         install_tailscale_macos
         connect_tailscale

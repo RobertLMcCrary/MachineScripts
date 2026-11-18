@@ -277,6 +277,12 @@ configure_sshd_key_only() {
         as_root mkdir -p /run/sshd
     fi
 
+    # sshd -t and -T exit with "no hostkeys available" until host keys
+    # exist. A fresh Mac only creates them on the first incoming SSH
+    # connection (and Arch on first sshd start), which is after this check.
+    # -A only generates the key types that are missing.
+    as_root ssh-keygen -A >/dev/null
+
     if as_root grep -Eiq \
         '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' \
         "$config"

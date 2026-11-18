@@ -99,6 +99,19 @@ fi
 log "Target account: $TARGET_USER"
 log "Target home: $TARGET_HOME"
 
+# Ask for the sudo password once, up front. With `curl | bash` stdin is the
+# pipe, so sudo needs a real terminal (it reads from /dev/tty).
+if [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+    if ! (: </dev/tty) 2>/dev/null; then
+        die "sudo needs a password but there is no terminal to ask in. Run this from a Terminal window (or as root)."
+    fi
+
+    log "Administrator access is required"
+
+    sudo -v </dev/tty ||
+        die "Could not get administrator access."
+fi
+
 # ------------------------------------------------------------
 # authorized_keys
 # ------------------------------------------------------------

@@ -361,13 +361,13 @@ verify_sshd_key_only() {
     fi
 
     if ! printf '%s\n' "$effective" |
-        grep -qx 'passwordauthentication no'
+        grep -qix 'passwordauthentication no'
     then
         die "sshd still allows password authentication. Look for an override with: grep -ri passwordauthentication /etc/ssh"
     fi
 
     if printf '%s\n' "$effective" |
-        grep -qx 'kbdinteractiveauthentication yes'
+        grep -qix 'kbdinteractiveauthentication yes'
     then
         die "sshd still allows keyboard-interactive authentication. Look for an override with: grep -ri kbdinteractive /etc/ssh"
     fi

@@ -60,14 +60,17 @@ Tailscale addresses.
 
 On macOS:
 
-- If Homebrew is installed, the CLI-only `tailscaled` is used. This is the best
-  fit for a headless Mac.
-- Otherwise the official Tailscale app is installed. It may ask you to approve
+- If Homebrew is installed (and writable by your account), the CLI-only
+  `tailscaled` is used and registered as a boot daemon with
+  `tailscaled install-system-daemon`. This is the best fit for a headless Mac.
+- Otherwise (no Homebrew, or Homebrew owned by another account, as on many
+  shared Macs) the official Tailscale app is installed. It may ask you to approve
   its network extension in System Settings, so someone needs to be at the machine.
 - If Remote Login is limited to **Only these users**, the account is added to
   the `com.apple.access_ssh` group. Without that, macOS rejects the login even
-  with a valid key. If an MDM profile blocks the change, the script stops and
-  says so.
+  with a valid key. Active Directory / network accounts are supported. If an
+  MDM profile blocks the change, the script stops and says so. On MDM-managed
+  Macs (e.g. Jamf), a management policy may reset this group later.
 - If Remote Login cannot be turned on automatically (recent macOS requires Full
   Disk Access for this), the script tells you to enable it under
   **System Settings > General > Sharing > Remote Login**.

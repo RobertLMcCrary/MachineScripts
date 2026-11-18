@@ -65,13 +65,27 @@ if [ "$PLATFORM" = 'macos' ] && [ -e /run/current-system/darwin-version ]; then
 fi
 
 TARGET_USER="${BOOTSTRAP_USER:-${SUDO_USER:-${USER:-$(id -un)}}}"
-TARGET_GROUP="$(id -gn "$TARGET_USER")"
+# Numeric gid: directory-service group names like "WIN\Domain Users"
+# contain spaces and backslashes.
+TARGET_GROUP="$(id -g "$TARGET_USER")" ||
+    die "Unknown user: $TARGET_USER"
 
 if [ "$PLATFORM" = 'macos' ]; then
+    # dscacheutil searches every directory node, so this also works for
+    # Active Directory / network accounts that have no local record.
     TARGET_HOME="$(
-        dscl . -read "/Users/$TARGET_USER" NFSHomeDirectory 2>/dev/null |
-        awk '{print $2}'
+        dscacheutil -q user -a name "$TARGET_USER" 2>/dev/null |
+        sed -n 's/^dir: //p' |
+        head -n 1
     )"
+
+    if [ -z "$TARGET_HOME" ]; then
+        TARGET_HOME="$(
+            dscl /Search -read "/Users/$TARGET_USER" NFSHomeDirectory 2>/dev/null |
+            sed -n 's/^NFSHomeDirectory: //p' |
+            head -n 1
+        )"
+    fi
 else
     TARGET_HOME="$(
         getent passwd "$TARGET_USER" 2>/dev/null |
@@ -425,12 +439,13 @@ enable_ssh_macos() {
     fi
 }
 
+# dsmemberutil resolves membership the same way sshd's SACL check does
+# (by GUID, including nested groups), which matters for AD accounts.
 ssh_access_member() {
-    as_root dseditgroup \
-        -o checkmember \
-        -m "$TARGET_USER" \
-        com.apple.access_ssh 2>/dev/null |
-        grep -q '^yes'
+    dsmemberutil checkmembership \
+        -U "$TARGET_USER" \
+        -G com.apple.access_ssh 2>/dev/null |
+        grep -q 'is a member'
 }
 
 # Remote Login set to "Only these users" rejects anyone outside this group,
@@ -453,14 +468,52 @@ configure_macos_ssh_access() {
 
     as_root dseditgroup \
         -o edit \
+        -n /Local/Default \
         -a "$TARGET_USER" \
         -t user \
         com.apple.access_ssh || true
+
+    as_root dscacheutil -flushcache || true
+
+    # dseditgroup can fail to resolve Active Directory / mobile accounts.
+    # Membership is checked by GUID, so write the GUID directly.
+    if ! ssh_access_member; then
+
+        local guid
+
+        guid="$(
+            dscl /Search -read "/Users/$TARGET_USER" GeneratedUID 2>/dev/null |
+            sed -n 's/^GeneratedUID: //p' |
+            head -n 1
+        )"
+
+        if [ -n "$guid" ]; then
+
+            as_root dscl . -append \
+                /Groups/com.apple.access_ssh \
+                GroupMembership "$TARGET_USER" || true
+
+            as_root dscl . -append \
+                /Groups/com.apple.access_ssh \
+                GroupMembers "$guid" || true
+
+            as_root dscacheutil -flushcache || true
+
+        fi
+
+    fi
 
     # MDM profiles can block or revert this, so check instead of trusting
     # the exit status.
     ssh_access_member ||
         die "Could not add $TARGET_USER to com.apple.access_ssh. An MDM policy may be blocking it; add the account under System Settings > General > Sharing > Remote Login."
+
+    # Jamf and other MDMs can rewrite this group later on a schedule.
+    if [ -d /Library/Application\ Support/JAMF ] ||
+       profiles status -type enrollment 2>/dev/null | grep -q 'MDM enrollment: Yes'
+    then
+        warn "This Mac is MDM-managed. If SSH access stops working later, a management policy may have reset Remote Login users."
+    fi
 }
 
 # ------------------------------------------------------------
@@ -530,6 +583,55 @@ start_tailscaled_linux() {
 # macOS Tailscale
 # ------------------------------------------------------------
 
+# Homebrew is often missing from PATH under sudo or a bare `curl | bash`.
+# Only use it if the target user can write to it (shared Macs often have
+# Homebrew owned by another account); otherwise use the official package.
+find_brew() {
+    local candidate
+    local prefix
+
+    for candidate in \
+        "$(command -v brew 2>/dev/null || true)" \
+        /opt/homebrew/bin/brew \
+        /usr/local/bin/brew
+    do
+        [ -n "$candidate" ] && [ -x "$candidate" ] || continue
+
+        prefix="$(as_target_user "$candidate" --prefix 2>/dev/null)" || continue
+
+        if as_target_user test -w "$prefix/Cellar" 2>/dev/null ||
+           as_target_user test -w "$prefix" 2>/dev/null
+        then
+            printf '%s\n' "$candidate"
+            return
+        fi
+
+        warn "Homebrew at $prefix is not writable by $TARGET_USER; not using it."
+    done
+}
+
+# Homebrew refuses to run as root, so drop to the target user if needed.
+as_target_user() {
+    if [ "$(id -u)" -eq 0 ]; then
+        sudo -u "$TARGET_USER" -H "$@"
+    else
+        "$@"
+    fi
+}
+
+wait_for_tailscaled() {
+    local i=0
+
+    while [ "$i" -lt 15 ]; do
+        "$TS_CMD" status >/dev/null 2>&1 && return
+        "$TS_CMD" status 2>&1 | grep -qi 'logged out\|NeedsLogin' && return
+        sleep 1
+        i=$((i + 1))
+    done
+
+    warn "tailscaled did not respond within 15 seconds."
+}
+
 install_tailscale_macos() {
 
     #
@@ -550,24 +652,35 @@ install_tailscale_macos() {
     # This is preferable for a server-style Mac.
     #
 
-    if have brew; then
+    local brew_bin
+
+    brew_bin="$(find_brew)"
+
+    if [ -n "$brew_bin" ]; then
 
         log "Installing CLI-only Tailscale using Homebrew"
 
-        brew install tailscale
+        local brew_prefix
+
+        brew_prefix="$(as_target_user "$brew_bin" --prefix)"
+
+        as_target_user "$brew_bin" install tailscale
 
         TS_MODE='daemon'
-        TS_CMD="$(brew --prefix)/bin/tailscale"
+        TS_CMD="$brew_prefix/bin/tailscale"
 
-        local brew_bin
+        # Homebrew's own service, or one installed by an earlier run.
+        if as_root launchctl print system/homebrew.mxcl.tailscale >/dev/null 2>&1 ||
+           as_root launchctl print system/com.tailscale.tailscaled >/dev/null 2>&1
+        then
+            log "tailscaled is already running"
+        else
+            # Tailscale's documented way to run the CLI daemon at boot.
+            # Avoids `sudo brew services`, which newer Homebrew discourages.
+            as_root "$brew_prefix/bin/tailscaled" install-system-daemon
+        fi
 
-        brew_bin="$(command -v brew)"
-
-        as_root \
-            "$brew_bin" \
-            services \
-            start \
-            tailscale
+        wait_for_tailscaled
 
         return
 
@@ -680,7 +793,7 @@ connect_tailscale() {
             "$TS_AUTH_KEY" \
             > "$key_file"
 
-        if [ "$PLATFORM" = 'linux' ]; then
+        if [ "${TS_MODE:-}" = 'daemon' ]; then
 
             as_root \
                 "$TS_CMD" \
@@ -703,7 +816,7 @@ connect_tailscale() {
         # tailscale up will display/open the login flow.
         #
 
-        if [ "$PLATFORM" = 'linux' ]; then
+        if [ "${TS_MODE:-}" = 'daemon' ]; then
 
             as_root "$TS_CMD" up
 

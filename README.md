@@ -12,6 +12,8 @@ The bootstrap scripts:
 - Enable services at startup
 - Run Tailscale login if the machine is not already authenticated
 - Test a real SSH login over Tailscale before reporting success (Linux and macOS)
+- Install [Rex](https://www.superlogical.com/rex/docs) and start its server, so
+  the machine can be a Rex remote host (Linux and macOS)
 - Print the `~/.ssh/config` entry to use on the computer you connect from
 
 > **Heads up:** password and keyboard-interactive SSH logins are turned off for
@@ -128,6 +130,32 @@ ssh h16003mac
 
 `HostName` is the machine's Tailscale IP, which works whether or not MagicDNS
 is on. With MagicDNS enabled you can use `NAME.your-tailnet.ts.net` instead.
+
+## Rex
+
+After SSH and Tailscale, `bootstrap.sh` installs Rex for the SSH account in
+`~/.local/bin/rex`, where Rex looks when it connects over SSH. If this step
+fails, the script warns and carries on, since SSH works without it.
+
+- **Linux:** runs Rex's own installer with `--user`, which also runs
+  `rex server install` so the server starts at boot (with systemd).
+- **macOS:** downloads the official release (stable, else preview), checks its
+  SHA-256, starts the server, and adds a LaunchAgent that starts it again at
+  every login. `rex server install` doesn't support macOS yet, so after a
+  reboot the server is down until someone logs in.
+
+Then, on the computer you connect from, add the machine as a host using its
+SSH alias. The script prints this line:
+
+```bash
+rex hosts add h16003mac ssh://h16003mac
+```
+
+In Rex for Mac, **Add Remote Host…** with `ssh://h16003mac` does the same. Use
+the `ssh://` form; a bare hostname makes Rex try port 7297, which the server
+does not listen on.
+
+Windows and NixOS are not covered yet.
 
 ## NixOS
 

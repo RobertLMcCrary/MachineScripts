@@ -885,6 +885,143 @@ connect_tailscale() {
 }
 
 # ------------------------------------------------------------
+# Rex
+# ------------------------------------------------------------
+
+# Rex looks for ~/.local/bin/rex when it connects over SSH, so rex does not
+# need to be on the PATH of a non-interactive login.
+REX_BIN="$TARGET_HOME/.local/bin/rex"
+REX_AGENT="$TARGET_HOME/Library/LaunchAgents/com.superlogical.rex.server-start.plist"
+REX_VERSION=''
+
+install_rex_linux() {
+    local installer
+    local rc=0
+
+    log "Installing Rex"
+
+    installer="$(mktemp)"
+
+    curl -fsSL https://pkgs.superlogical.com/rex/install.sh -o "$installer" || rc=1
+
+    if [ "$rc" -eq 0 ]; then
+        # mktemp makes it 0600, and the target user may not be the one running this.
+        chmod 644 "$installer"
+
+        # --user installs into ~/.local/bin and, with systemd, runs
+        # `rex server install` so the server starts at boot.
+        as_target_user sh "$installer" --user </dev/null || rc=1
+    fi
+
+    rm -f "$installer"
+
+    return "$rc"
+}
+
+install_rex_macos() {
+    local arch
+    local channel
+    local release=''
+    local pick
+    local url
+    local sha
+    local dir
+    local rc=0
+
+    have jq || {
+        warn "jq is missing (macOS 15 and later include it)."
+        return 1
+    }
+
+    case "$(uname -m)" in
+        arm64) arch='arm64' ;;
+        *) arch='amd64' ;;
+    esac
+
+    # There is no stable release yet. Fall back to preview, as Rex's own
+    # Linux installer does.
+    for channel in stable preview; do
+        release="$(curl -fsSL "https://blob.superlogical.com/api/releases/rex/$channel" 2>/dev/null)" && break
+        release=''
+    done
+
+    # The standalone binary. The one inside Rex.app is tied to the app's
+    # Info.plist and macOS kills it when it is copied out on its own.
+    pick='first(.artifacts[] | select(.os == "darwin" and .arch == $arch and (.filename | endswith(".zip"))))'
+
+    url="$(printf '%s' "$release" | jq -er --arg arch "$arch" "$pick | .downloadUrl")" &&
+    sha="$(printf '%s' "$release" | jq -er --arg arch "$arch" "$pick | .sha256")" || {
+        warn "Could not find a Rex release for macOS $arch."
+        return 1
+    }
+
+    log "Installing Rex ($channel channel)"
+
+    dir="$(mktemp -d)"
+
+    if curl -fsSL "$url" -o "$dir/rex.zip" &&
+       printf '%s  %s\n' "$sha" "$dir/rex.zip" | shasum -a 256 -c - >/dev/null &&
+       unzip -q "$dir/rex.zip" rex -d "$dir"
+    then
+        # rm first: an older manual install may have left a symlink here.
+        as_target_user mkdir -p "$TARGET_HOME/.local/bin" &&
+        as_root rm -f "$REX_BIN" &&
+        as_root install -m 755 -o "$TARGET_USER" -g "$TARGET_GROUP" "$dir/rex" "$REX_BIN" ||
+            rc=1
+    else
+        warn "Downloading or verifying Rex failed."
+        rc=1
+    fi
+
+    rm -rf "$dir"
+
+    [ "$rc" -eq 0 ] || return 1
+
+    # `rex server install` does not support macOS yet. Start the server now,
+    # and again at every login. After a reboot it is down until someone logs in.
+    log "Starting the Rex server (and at every login)"
+
+    as_target_user mkdir -p "$TARGET_HOME/Library/LaunchAgents" || return 1
+
+    # AbandonProcessGroup: `rex server start` leaves the server running in
+    # the background, and launchd would otherwise kill it when the job exits.
+    as_target_user tee "$REX_AGENT" >/dev/null <<EOF || return 1
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.superlogical.rex.server-start</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$REX_BIN</string>
+        <string>server</string>
+        <string>start</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>AbandonProcessGroup</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
+    as_target_user "$REX_BIN" server start >/dev/null
+}
+
+install_rex() {
+    if [ "$PLATFORM" = 'linux' ]; then
+        install_rex_linux || return 1
+    else
+        install_rex_macos || return 1
+    fi
+
+    REX_VERSION="$(as_target_user "$REX_BIN" version 2>/dev/null | head -n 1)"
+
+    [ -n "$REX_VERSION" ]
+}
+
+# ------------------------------------------------------------
 # Result
 # ------------------------------------------------------------
 
@@ -1040,6 +1177,12 @@ show_result() {
     printf '\n'
     printf 'Then connect with:\n\n'
     printf '  ssh %s\n\n' "$alias_name"
+
+    if [ -n "$REX_VERSION" ]; then
+        printf 'Rex is installed (%s). To use this machine as a Rex\n' "$REX_VERSION"
+        printf 'remote host, run this on the computer you connect from:\n\n'
+        printf '  rex hosts add %s ssh://%s\n\n' "$alias_name" "$alias_name"
+    fi
 }
 
 # ------------------------------------------------------------
@@ -1079,6 +1222,10 @@ main() {
         connect_tailscale
 
     fi
+
+    # Optional extra: SSH works without it, so a failure only warns.
+    install_rex ||
+        warn "Rex could not be installed. SSH still works; install Rex by hand later."
 
     show_result
 }

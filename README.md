@@ -34,6 +34,17 @@ Complete the Tailscale login if prompted.
 On Windows, the default all-interface SSH firewall rule is disabled and replaced
 with one that only accepts connections from Tailscale addresses.
 
+OpenSSH Server is installed as the built-in Windows feature when possible. On
+machines that get updates from WSUS / SCCM / Intune (common on work and school
+PCs), Windows can't download that feature (error `0x800f0954`), so the script
+falls back to Microsoft's [Win32-OpenSSH](https://github.com/PowerShell/Win32-OpenSSH)
+MSI from GitHub. If Group Policy makes Windows ignore local firewall rules, the
+script warns you: ask IT to allow inbound TCP 22 from `100.64.0.0/10`.
+
+The script ends with **SERVER BOOTSTRAP COMPLETE** only if sshd is running and
+listening, password logins are off, and Tailscale is connected. Otherwise it
+prints **NOT READY** with the reasons.
+
 After setup:
 
 ```powershell
